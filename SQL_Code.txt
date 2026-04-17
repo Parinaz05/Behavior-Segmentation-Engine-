@@ -1,0 +1,144 @@
+create database project;
+use project; 
+
+-- 1. Customers Table (Linking unique identity)
+CREATE TABLE customers (
+    customer_id VARCHAR(50) PRIMARY KEY,
+    customer_unique_id VARCHAR(50),
+    customer_zip_code_prefix INT,
+    customer_city VARCHAR(100),
+    customer_state CHAR(2)
+);
+
+-- 2. Orders Table (The heart of Recency and Frequency)
+CREATE TABLE orders (
+    order_id VARCHAR(50) PRIMARY KEY,
+    customer_id VARCHAR(50),
+    order_status VARCHAR(20),
+    order_purchase_timestamp DATETIME,
+    order_approved_at DATETIME,
+    order_delivered_carrier_date DATETIME,
+    order_delivered_customer_date DATETIME,
+    order_estimated_delivery_date DATETIME
+);
+
+-- 3. Payments Table (The source of Monetary value)
+CREATE TABLE order_payments (
+    order_id VARCHAR(50),
+    payment_sequential INT,
+    payment_type VARCHAR(20),
+    payment_installments INT,
+    payment_value DECIMAL(10, 2)
+);
+
+select * from customers limit 10;
+select * from order_payments limit 10;
+select * from orders limit 10;
+
+SET SQL_SAFE_UPDATES = 0;
+
+-- A. Remove "Noise": Only analyze orders that actually generated revenue
+DELETE FROM orders 
+WHERE order_status NOT IN ('delivered', 'shipped');
+
+-- B. Handle Nulls in Payments: Ensure monetary calculations don't break
+UPDATE order_payments 
+SET payment_value = 0 
+WHERE payment_value IS NULL;
+
+-- C. Verification: Ensure the cleaning worked
+SELECT order_status, COUNT(*) AS total_rows
+FROM orders
+GROUP BY order_status;
+
+-- Creating "Bookmarks" for the database to find IDs faster
+CREATE INDEX idx_orders_customer ON orders (customer_id);
+CREATE INDEX idx_orders_order_id ON orders (order_id);
+CREATE INDEX idx_payments_order_id ON order_payments (order_id);
+CREATE INDEX idx_customers_unique ON customers (customer_unique_id);
+
+CREATE OR REPLACE VIEW v_rfm_base AS
+SELECT 
+    base.*,
+    -- RFM Scores
+    NTILE(5) OVER (ORDER BY recency_days ASC) AS R_Score,
+    NTILE(5) OVER (ORDER BY frequency_total DESC) AS F_Score,
+    NTILE(5) OVER (ORDER BY monetary_value DESC) AS M_Score
+FROM (
+    SELECT 
+        c.customer_unique_id,
+        -- Recency
+        DATEDIFF(
+            (SELECT MAX(order_purchase_timestamp) FROM orders),
+            MAX(o.order_purchase_timestamp)
+        ) AS recency_days,
+        -- Frequency
+        COUNT(DISTINCT o.order_id) AS frequency_total,
+        -- Monetary
+        SUM(p.payment_value) AS monetary_value
+    FROM customers c
+    JOIN orders o ON c.customer_id = o.customer_id
+    JOIN order_payments p ON o.order_id = p.order_id
+    WHERE o.order_status IN ('delivered', 'shipped')
+    GROUP BY c.customer_unique_id
+) AS base;
+
+CREATE OR REPLACE VIEW v_customer_segments AS
+SELECT 
+    *,
+    -- Total Score
+    (R_Score + F_Score + M_Score) AS Total_RFM_Score,
+    -- Persona Classification
+    CASE 
+        WHEN R_Score >= 4 AND F_Score >= 4 AND M_Score >= 4 THEN 'Champions'
+        WHEN R_Score >= 4 AND F_Score >= 3 THEN 'Loyal Customers'
+        WHEN R_Score >= 4 AND F_Score <= 2 THEN 'New Customers'
+        WHEN R_Score <= 2 AND F_Score >= 4 AND M_Score >= 3 THEN 'At Risk'
+        WHEN R_Score <= 2 AND F_Score <= 2 THEN 'Lost Customers'
+        ELSE 'Regular Customers'
+    END AS Customer_Persona
+FROM v_rfm_base;
+
+SELECT * FROM v_customer_segments LIMIT 10;
+
+SELECT Customer_Persona, COUNT(*) 
+FROM v_customer_segments
+GROUP BY Customer_Persona;
+
+SELECT 
+    customer_unique_id,
+    monetary_value / frequency_total AS avg_order_value
+FROM v_rfm_base;
+
+SELECT 
+    Customer_Persona,
+    COUNT(*) AS customers,
+    SUM(monetary_value) AS total_revenue
+FROM v_customer_segments
+GROUP BY Customer_Persona;
+
+SELECT *
+FROM v_customer_segments
+ORDER BY monetary_value DESC
+LIMIT 10;
+
+SELECT 
+    CASE 
+        WHEN frequency_total = 1 THEN 'One-Time'
+        ELSE 'Repeat'
+    END AS customer_type,
+    COUNT(*) AS total
+FROM v_rfm_base
+GROUP BY customer_type;
+
+SELECT 
+    DATE_FORMAT(o.order_purchase_timestamp, '%Y-%m') AS month,
+    SUM(p.payment_value) AS revenue
+FROM orders o
+JOIN order_payments p ON o.order_id = p.order_id
+WHERE o.order_status IN ('delivered', 'shipped')
+GROUP BY month
+ORDER BY month;
+
+SELECT * FROM v_rfm_base;
+ALTER USER 'root'@'localhost' IDENTIFIED BY 'newpassword123';
